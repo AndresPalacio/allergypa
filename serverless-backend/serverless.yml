@@ -1,0 +1,428 @@
+service: user-backend
+frameworkVersion: '3'
+
+plugins:
+  - serverless-iam-roles-per-function
+  - serverless-step-functions
+  - serverless-dotenv-plugin
+
+useDotenv: true
+
+provider:
+  name: aws
+  runtime: nodejs16.x
+  region: us-east-1
+  apiGateway:
+    apiKeys:
+      - user-key
+
+custom:
+  # replace with your verified SES domain
+  ses_domain: ${env:SES_DOMAIN} 
+  jwt_issuer: ${env:JWT_ISSUER}
+  jwt_audience: ${env:JWT_AUDIENCE}
+  jwt_subject: ${env:JWT_SUBJECT}
+  jwt_secret: ${env:JWT_SECRET}
+  uploaded_s3_bucket_name: ${self:service}-user-po
+  dynamodb_name: ${self:service}-user-po
+  sts_user: ${self:service}-user-po
+  admin_user: ${self:service}-user-admin-po
+  admin_email: ${env:ADMIN_EMAIL}
+  sts_expiry: 900
+  jwt_expiry: 15m
+  region: us-east-1
+
+functions:
+  createUser:
+    handler: src/functions/cognito/create-user.handler
+    environment:
+      USERPOOL_ID: !Ref UserPool
+      ADMIN_ACCESS_KEY: ${self:outputs.AdminUserAccessKeyId.Value}
+      ADMIN_SECRET_KEY: ${self:outputs.AdminUserSecretKey.Value}
+      ADMIN_EMAIL: ${self:custom.admin_email}
+    events:
+      - http: 
+          path: create-user
+          method: post
+          cors: true
+          private: true
+          authorizer:
+            name: CognitoAuthorizer
+            type: COGNITO_USER_POOLS
+            arn:
+              Fn::GetAtt: [UserPool, Arn]
+    
+  getUsers:
+    handler: src/functions/cognito/get-users.handler
+    environment:
+      USERPOOL_ID: !Ref UserPool
+      ADMIN_ACCESS_KEY: ${self:outputs.AdminUserAccessKeyId.Value}
+      ADMIN_SECRET_KEY: ${self:outputs.AdminUserSecretKey.Value}
+      ADMIN_EMAIL: ${self:custom.admin_email}
+    events:
+      - http: 
+          path: get-users
+          method: get
+          cors: true
+          private: true
+          authorizer:
+            name: CognitoAuthorizer
+            type: COGNITO_USER_POOLS
+            arn:
+              Fn::GetAtt: [UserPool, Arn]
+
+  defineAuthChallenge:
+    handler: src/functions/cognito/define-auth-challenge.handler
+
+  createAuthChallenge:
+    handler: src/functions/cognito/create-auth-challenge.handler
+    environment:
+      SES_FROM_ADDRESS: ${self:custom.ses_domain}
+      DYNAMODB_NAME: ${self:custom.dynamodb_name}
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - iot:*
+        Resource: '*'
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+          - dynamodb:Scan
+          - dynamodb:GetItem
+          - dynamodb:PutItem
+        Resource:
+          - !GetAtt UserDB.Arn
+      - Effect: Allow
+        Action: ses:SendEmail
+        Resource: 
+          - !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+          - !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/*
+
+  verifyAuthChallengeResponse:
+    handler: src/functions/cognito/verify-auth-challenge-response.handler
+     
+resources:
+  Resources:   
+    # User pool 
+    UserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        UsernameConfiguration:
+          CaseSensitive: false
+        UsernameAttributes:
+          - email
+        Policies:
+          # this is only to satisfy Cognito requirements
+          # we won't be using passwords, but we also don't
+          # want weak passwords in the system ;-)
+          PasswordPolicy:
+            MinimumLength: 8
+            RequireLowercase: true
+            RequireNumbers: true
+            RequireUppercase: true
+            RequireSymbols: true
+        Schema:
+          - AttributeDataType: String
+            Mutable: false
+            Required: true
+            Name: email
+            StringAttributeConstraints: 
+              MinLength: '8'
+        LambdaConfig:
+          DefineAuthChallenge: !GetAtt DefineAuthChallengeLambdaFunction.Arn
+          CreateAuthChallenge: !GetAtt CreateAuthChallengeLambdaFunction.Arn
+          VerifyAuthChallengeResponse: !GetAtt VerifyAuthChallengeResponseLambdaFunction.Arn
+
+    UserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        ClientName: web
+        UserPoolId: !Ref UserPool
+        ExplicitAuthFlows:
+          - ALLOW_CUSTOM_AUTH
+          - ALLOW_REFRESH_TOKEN_AUTH
+          - ALLOW_USER_SRP_AUTH
+        PreventUserExistenceErrors: ENABLED
+
+    IdentityPool:
+      Type: AWS::Cognito::IdentityPool
+      Properties:
+        IdentityPoolName: identity_pool
+        AllowUnauthenticatedIdentities: true
+        CognitoIdentityProviders:
+          - ClientId:
+              Ref: UserPoolClient
+            ProviderName:
+              Fn::GetAtt: [UserPool, ProviderName]
+    
+    # Cognito roles
+    CognitoIdentityPoolRoles:
+      Type: AWS::Cognito::IdentityPoolRoleAttachment
+      Properties:
+        IdentityPoolId:
+          Ref: IdentityPool
+        Roles:
+          authenticated:
+            Fn::GetAtt: [CognitoAuthRole, Arn]
+          unauthenticated:
+            Fn::GetAtt: [CognitoUnauthRole, Arn]
+    
+    CognitoAuthRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:service}_appAuthRole
+        Path: /
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal:
+                Federated: "cognito-identity.amazonaws.com"
+              Action:
+                - "sts:AssumeRoleWithWebIdentity"
+              Condition:
+                StringEquals:
+                  "cognito-identity.amazonaws.com:aud":
+                    Ref: IdentityPool
+                "ForAnyValue:StringLike":
+                  "cognito-identity.amazonaws.com:amr": authenticated
+        Policies:
+          - PolicyName: "CognitoAuthorizedPolicy"
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: "Allow"
+                  Action:
+                    - "mobileanalytics:PutEvents"
+                    - "cognito-sync:*"
+                    - "cognito-identity:*"
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - iot:Connect
+                    - iot:Subscribe
+                    - iot:Receive
+                  Resource: "*"
+                - Effect: "Allow"
+                  Action: 
+                    - "s3:PutObject"
+                    - "s3:GetObject"
+                  Resource: "arn:aws:s3:::${self:custom.uploaded_s3_bucket_name}/public/*"
+                - Effect: "Allow"
+                  Action: 
+                    - "s3:GetObject"
+                    - "s3:ListAllMyBuckets"
+                    - "s3:PutObject"
+                  Resource:
+                  - Fn::Join:
+                    - ''
+                    -
+                      - Fn::GetAtt: [UploadedS3Bucket, Arn]
+                      - '/private/'
+                      - '$'
+                      - '{cognito-identity.amazonaws.com:sub}/*'
+
+    CognitoUnauthRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:service}_appUnauthRole
+        Path: /
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal:
+                Federated: "cognito-identity.amazonaws.com"
+              Action:
+                - "sts:AssumeRoleWithWebIdentity"
+              Condition:
+                StringEquals:
+                  "cognito-identity.amazonaws.com:aud":
+                    Ref: IdentityPool
+                "ForAnyValue:StringLike":
+                  "cognito-identity.amazonaws.com:amr": unauthenticated
+        Policies:
+          - PolicyName: "CognitoUnauthorizedPolicy"
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: "Allow"
+                  Action:
+                    - "mobileanalytics:PutEvents"
+                    - "cognito-sync:*"
+                    - "cognito-identity:*"
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - iot:Connect
+                    - iot:Subscribe
+                    - iot:Receive
+                  Resource: "*"
+                - Effect: "Allow"
+                  Action: 
+                    - "s3:PutObject"
+                    - "s3:GetObject"
+                  Resource: "arn:aws:s3:::${self:custom.uploaded_s3_bucket_name}/public/*"
+    
+    # S3 Bucket
+    UploadedS3Bucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.uploaded_s3_bucket_name}
+        LifecycleConfiguration:
+          Rules:
+            - Id: DeleteRule
+              Status: Enabled
+              ExpirationInDays: 1
+        CorsConfiguration:
+          CorsRules:
+          - AllowedHeaders: 
+              - '*'
+            AllowedMethods: 
+              - HEAD
+              - GET
+              - PUT
+              - POST
+            AllowedOrigins: 
+              - '*'
+            ExposedHeaders:
+              - x-amz-server-side-encryption
+              - x-amz-request-id
+              - x-amz-id-2
+            MaxAge: 3000
+    
+    #DynamoDB
+    UserDB:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Retain
+      Properties:
+        TableName: ${self:custom.dynamodb_name}
+        AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GS1PK
+          AttributeType: S
+        - AttributeName: GS1SK
+          AttributeType: S
+        KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: GS1
+            KeySchema:
+              - AttributeName: GS1PK
+                KeyType: HASH
+              - AttributeName: GS1SK
+                KeyType: RANGE
+            Projection:
+              ProjectionType: 'ALL'
+        BillingMode: PAY_PER_REQUEST
+        StreamSpecification:
+          StreamViewType: NEW_IMAGE
+
+    #IAM USER
+    StsUser:
+      Type: AWS::IAM::User
+      Properties:
+        UserName: ${self:custom.sts_user}
+        ManagedPolicyArns:
+        - !Ref SampleManagedPolicy
+
+    StsUserCredentials:
+      Type: AWS::IAM::AccessKey
+      Properties:
+        Status: Active
+        UserName: !Ref StsUser
+    
+    SampleManagedPolicy:
+      Type: AWS::IAM::ManagedPolicy
+      Properties: 
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - sts:*
+                - apigateway:*
+              Resource: "*"
+            - Effect: "Allow"
+              Action:
+                - execute-api:*
+              Resource: "*"
+              
+    #Admin user
+    AdminUser:
+      Type: AWS::IAM::User
+      Properties:
+        UserName: ${self:custom.admin_user}
+        ManagedPolicyArns:
+        - !Ref AdminManagedPolicy
+
+    AdminUserCredentials:
+      Type: AWS::IAM::AccessKey
+      Properties:
+        Status: Active
+        UserName: !Ref AdminUser
+    
+    AdminManagedPolicy:
+      Type: AWS::IAM::ManagedPolicy
+      Properties: 
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:ListUsers
+              Resource: !GetAtt UserPool.Arn 
+
+    # Lambda permissions
+    UserPoolDefineAuthChallengeLambdaPermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        Action: lambda:invokeFunction
+        Principal: cognito-idp.amazonaws.com
+        FunctionName: !Ref DefineAuthChallengeLambdaFunction
+        SourceArn: !GetAtt UserPool.Arn
+
+    UserPoolCreateAuthChallengeLambdaPermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        Action: lambda:invokeFunction
+        Principal: cognito-idp.amazonaws.com
+        FunctionName: !Ref CreateAuthChallengeLambdaFunction
+        SourceArn: !GetAtt UserPool.Arn
+
+    UserPoolVerifyAuthChallengeResponseLambdaPermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        Action: lambda:invokeFunction
+        Principal: cognito-idp.amazonaws.com
+        FunctionName: !Ref VerifyAuthChallengeResponseLambdaFunction
+        SourceArn: !GetAtt UserPool.Arn
+
+outputs:
+  CompareFaceStateMachine:
+      Description: The ARN of the CompareFace state machine
+      Value:
+        Ref: CompareFaceMachine
+  DynamoDbId:
+      Description: The ARN of the DynamoDB
+      Value:
+        Ref: UserDB
+  StsUserAccessKeyId:
+      Value:
+        Ref: StsUserCredentials
+  StsUserSecretKey:
+      Value:
+        Fn::GetAtt: [ "StsUserCredentials", "SecretAccessKey" ]
+  AdminUserAccessKeyId:
+      Value:
+        Ref: AdminUserCredentials
+  AdminUserSecretKey:
+      Value:
+        Fn::GetAtt: [ "AdminUserCredentials", "SecretAccessKey" ]

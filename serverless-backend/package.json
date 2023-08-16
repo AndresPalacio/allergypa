@@ -1,0 +1,36 @@
+{
+  "name": "backend",
+  "description": "Serverless template containing all that is needed to deploy the backend cognito ",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "devDependencies": {
+    "serverless-dotenv-plugin": "^6.0.0",
+    "serverless-iam-roles-per-function": "^3.2.0",
+    "serverless-lumigo": "^1.14.3",
+    "serverless-step-functions": "^3.13.0"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AndresPalacio/allergypa/tree/master"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/AndresPalacio/allergypa/tree/master"
+  },
+  "homepage": "https://github.com/AndresPalacio/allergypa/tree/masterl#readme",
+  "dependencies": {
+    "@aws-sdk/client-sesv2": "^3.312.0",
+    "@lumigo/tracer": "^1.79.4",
+    "chance": "^1.1.11",
+    "dayjs": "^1.11.7",
+    "jose": "^4.14.0",
+    "lodash": "^4.17.21",
+    "uuid": "^9.0.0"
+  }
+}
