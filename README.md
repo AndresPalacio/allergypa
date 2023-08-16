@@ -117,6 +117,3 @@ aws cognito-idp admin-confirm-sign-up --user-pool-id <your_pool_id> --username c
 `aws cognito-idp admin-delete-user --username {{username}} --user-pool-id {{user_pool_id}}`
 
 
-
-
-https://github.com/search?q=+extends+UserPoolClient+%7B+language%3ATypeScript&type=code
